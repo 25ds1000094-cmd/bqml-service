@@ -1,16 +1,18 @@
 from flask import Flask, request, jsonify
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import json
 import math
+import os
 import re
+import sqlite3
 
 app = Flask(__name__)
 
-# runId -> frozen successful/unsuccessful selection response
-RUNS = {}
+DB_PATH = os.environ.get("DB_PATH", "/tmp/bqml_runs.db")
 
-MAX_SAFE_INT = 9007199254740991
+MAX_SAFE_INTEGER = 9007199254740991
 
 TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T"
@@ -23,67 +25,97 @@ DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # ============================================================
-# BASIC HELPERS
+# DATABASE
 # ============================================================
 
-def safe_int(x):
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            response TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def get_run(run_id):
+    conn = db()
+
+    row = conn.execute(
+        "SELECT fingerprint, response FROM runs WHERE run_id = ?",
+        (run_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if row is None:
+        return None
+
+    return {
+        "fingerprint": row[0],
+        "response": json.loads(row[1])
+    }
+
+
+def save_run(run_id, fingerprint, response):
+    conn = db()
+
+    conn.execute(
+        """
+        INSERT INTO runs(run_id, fingerprint, response)
+        VALUES (?, ?, ?)
+        """,
+        (
+            run_id,
+            fingerprint,
+            json.dumps(
+                response,
+                ensure_ascii=False,
+                separators=(",", ":")
+            )
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def safe_integer(value):
     return (
-        isinstance(x, int)
-        and not isinstance(x, bool)
-        and 0 <= x <= MAX_SAFE_INT
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= MAX_SAFE_INTEGER
     )
 
 
-def finite_number(x):
+def finite_number(value):
     return (
-        isinstance(x, (int, float))
-        and not isinstance(x, bool)
-        and math.isfinite(float(x))
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
     )
 
 
-def utf8_key(x):
-    return x.encode("utf-8")
+def utf8_key(value):
+    return value.encode("utf-8")
 
 
-def sorted_utf8(values):
+def utf8_sorted(values):
     return sorted(values, key=utf8_key)
 
 
-def unique_sorted_utf8(values):
+def sort_codes(values):
     return sorted(set(values), key=utf8_key)
 
 
-def sorted_codes(values):
-    return sorted(set(values), key=utf8_key)
-
-
-def compact_json(obj):
-    # Exact compact JSON: no spaces.
-    return json.dumps(
-        obj,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def sha256_compact_json(obj):
-    payload = compact_json(obj).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def parse_instant(value):
-    """
-    Strictly accept:
-
-    YYYY-MM-DDTHH:mm:ssZ
-    YYYY-MM-DDTHH:mm:ss.sZ
-    YYYY-MM-DDTHH:mm:ss.ssZ
-    YYYY-MM-DDTHH:mm:ss.sssZ
-
-    or the same with ±HH:mm.
-    """
-
+def parse_timestamp(value):
     if not isinstance(value, str):
         return None
 
@@ -91,12 +123,12 @@ def parse_instant(value):
         return None
 
     try:
-        normalized = value
+        text = value
 
-        if normalized.endswith("Z"):
-            normalized = normalized[:-1] + "+00:00"
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
 
-        dt = datetime.fromisoformat(normalized)
+        dt = datetime.fromisoformat(text)
 
         if dt.tzinfo is None:
             return None
@@ -107,49 +139,69 @@ def parse_instant(value):
         return None
 
 
+def compact_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+
+def sha256_json(value):
+    return hashlib.sha256(
+        compact_json(value).encode("utf-8")
+    ).hexdigest()
+
+
+def round_12(value):
+    """
+    Decimal half-up rounding to 12 decimal places.
+    """
+    d = Decimal(str(value))
+    result = d.quantize(
+        Decimal("0.000000000001"),
+        rounding=ROUND_HALF_UP
+    )
+    return float(result)
+
+
 # ============================================================
 # SELECTION ROW VALIDATION
 # ============================================================
 
-def validate_selection_row(row):
+def valid_selection_row(row):
+
     if not isinstance(row, dict):
         return False
 
-    required = {
+    required = [
         "id",
         "entity",
         "eventTime",
         "predictionTime",
         "version",
         "split",
-        "features",
-    }
+        "features"
+    ]
 
-    # Require the expected fields.
-    if not required.issubset(row.keys()):
-        return False
+    for key in required:
+        if key not in row:
+            return False
 
+    # The specification does NOT say these must be non-empty.
     if not isinstance(row["id"], str):
         return False
 
     if not isinstance(row["entity"], str):
         return False
 
-    # Empty IDs/entities are not useful row identifiers.
-    if row["id"] == "":
+    if parse_timestamp(row["eventTime"]) is None:
         return False
 
-    if row["entity"] == "":
+    if parse_timestamp(row["predictionTime"]) is None:
         return False
 
-    # Both timestamps must be valid instants.
-    if parse_instant(row["eventTime"]) is None:
-        return False
-
-    if parse_instant(row["predictionTime"]) is None:
-        return False
-
-    if not safe_int(row["version"]):
+    if not safe_integer(row["version"]):
         return False
 
     if row["split"] not in ("TRAIN", "EVAL"):
@@ -158,46 +210,48 @@ def validate_selection_row(row):
     if not isinstance(row["features"], dict):
         return False
 
-    # Validate every feature object now.
+    # Validate feature structure.
     #
-    # This is important: don't silently ignore malformed feature data.
-    for feature_name, feature_data in row["features"].items():
+    # IMPORTANT:
+    # feature["value"] is NEVER interpreted.
+    # It is arbitrary data.
+    for name, feature in row["features"].items():
 
-        if not isinstance(feature_name, str):
+        if not isinstance(name, str):
             return False
 
-        if not isinstance(feature_data, dict):
+        if not isinstance(feature, dict):
             return False
 
-        if "value" not in feature_data:
+        if "value" not in feature:
             return False
 
-        if "availableAt" not in feature_data:
+        if "availableAt" not in feature:
             return False
 
-        if parse_instant(feature_data["availableAt"]) is None:
+        if parse_timestamp(feature["availableAt"]) is None:
             return False
 
     return True
 
 
-def validate_all_selection_rows(rows):
+def valid_selection_rows(rows):
+
     if not isinstance(rows, list):
         return False
 
-    # Row IDs must be unique within the supplied array.
     ids = set()
 
     for row in rows:
-        if not validate_selection_row(row):
+
+        if not valid_selection_row(row):
             return False
 
-        row_id = row["id"]
-
-        if row_id in ids:
+        # IDs must be unique in the supplied array.
+        if row["id"] in ids:
             return False
 
-        ids.add(row_id)
+        ids.add(row["id"])
 
     return True
 
@@ -206,108 +260,104 @@ def validate_all_selection_rows(rows):
 # DEDUPLICATION
 # ============================================================
 
-def deduplicate_rows(rows):
-    """
-    Deduplicate by:
-
-        [entity, UTC(eventTime)]
-
-    Keep:
-        highest integer version
-
-    If versions tie:
-        UTF-8-byte-smallest ID
-    """
+def deduplicate(rows):
 
     groups = {}
 
     for row in rows:
-        event_utc = parse_instant(row["eventTime"])
+
+        # Parse to UTC first.
+        event_time_utc = parse_timestamp(
+            row["eventTime"]
+        )
 
         key = (
             row["entity"],
-            event_utc,
+            event_time_utc
         )
 
-        current = groups.get(key)
+        existing = groups.get(key)
 
-        if current is None:
+        if existing is None:
             groups[key] = row
             continue
 
-        if row["version"] > current["version"]:
+        # Highest version wins.
+        if row["version"] > existing["version"]:
             groups[key] = row
 
-        elif row["version"] == current["version"]:
-            if utf8_key(row["id"]) < utf8_key(current["id"]):
+        # Same version:
+        # UTF-8-byte-smallest ID wins.
+        elif row["version"] == existing["version"]:
+
+            if utf8_key(row["id"]) < utf8_key(existing["id"]):
                 groups[key] = row
 
     return list(groups.values())
 
 
 # ============================================================
-# POINT-IN-TIME FEATURE CHECK
+# POINT-IN-TIME FEATURE ELIGIBILITY
 # ============================================================
 
-def find_shared_eligible_features(rows, forbidden_features):
-    """
-    A feature is eligible only if:
-
-    1. It appears in EVERY retained row.
-    2. It is not forbidden.
-    3. availableAt <= predictionTime in EVERY retained row.
-    """
+def eligible_features(rows, forbidden_features):
 
     if not rows:
         return []
 
     forbidden = set(forbidden_features)
 
-    # Start with all features from the first retained row.
+    # Feature must appear in EVERY retained row.
     shared = set(rows[0]["features"].keys())
 
-    # Intersection means the feature must appear everywhere.
     for row in rows[1:]:
-        shared.intersection_update(row["features"].keys())
+        shared.intersection_update(
+            row["features"].keys()
+        )
 
     eligible = []
 
-    for name in shared:
+    for feature_name in shared:
 
-        if name in forbidden:
+        # Forbidden features are removed.
+        if feature_name in forbidden:
             continue
 
-        feature_is_safe = True
+        eligible_here = True
 
         for row in rows:
-            feature_data = row["features"][name]
 
-            available_at = parse_instant(
-                feature_data["availableAt"]
+            feature = row["features"][feature_name]
+
+            available_at = parse_timestamp(
+                feature["availableAt"]
             )
 
-            prediction_time = parse_instant(
+            prediction_time = parse_timestamp(
                 row["predictionTime"]
             )
 
-            # Point-in-time rule.
+            # Point-in-time safety:
             #
-            # Equality is allowed.
+            # availableAt <= predictionTime
+            #
+            # Equality is valid.
             if available_at > prediction_time:
-                feature_is_safe = False
+                eligible_here = False
                 break
 
-        if feature_is_safe:
-            eligible.append(name)
+        if eligible_here:
+            eligible.append(feature_name)
 
-    return sorted_utf8(eligible)
+    return utf8_sorted(eligible)
 
 
 # ============================================================
-# TRIAL VALIDATION / SELECTION
+# TRIALS
 # ============================================================
 
-def validate_trial(trial):
+def valid_trial(trial):
+
     if not isinstance(trial, dict):
         return False
 
@@ -320,40 +370,40 @@ def validate_trial(trial):
     if "evalMetric" not in trial:
         return False
 
-    if not safe_int(trial["trialId"]):
+    if not safe_integer(trial["trialId"]):
         return False
 
-    if trial["status"] not in ("SUCCEEDED", "FAILED"):
+    if trial["status"] not in (
+        "SUCCEEDED",
+        "FAILED"
+    ):
         return False
 
-    # evalMetric itself can be non-finite.
-    # Those trials are simply ineligible later.
-    #
-    # Therefore don't reject the whole request here.
     return True
 
 
-def validate_all_trials(trials):
+def valid_trials(trials):
+
     if not isinstance(trials, list):
         return False
 
     ids = set()
 
     for trial in trials:
-        if not validate_trial(trial):
+
+        if not valid_trial(trial):
             return False
 
-        trial_id = trial["trialId"]
-
-        if trial_id in ids:
+        if trial["trialId"] in ids:
             return False
 
-        ids.add(trial_id)
+        ids.add(trial["trialId"])
 
     return True
 
 
-def choose_trial(trials):
+def select_trial(trials):
+
     eligible = []
 
     for trial in trials:
@@ -361,6 +411,7 @@ def choose_trial(trials):
         if trial["status"] != "SUCCEEDED":
             continue
 
+        # Only finite successful metrics are eligible.
         if not finite_number(trial["evalMetric"]):
             continue
 
@@ -369,14 +420,13 @@ def choose_trial(trials):
     if not eligible:
         return None
 
-    # Highest metric first.
+    # Highest metric.
     #
-    # If metrics are exactly tied:
-    # smallest integer trialId wins.
+    # Exact tie -> smallest trialId.
     eligible.sort(
         key=lambda trial: (
             -float(trial["evalMetric"]),
-            trial["trialId"],
+            trial["trialId"]
         )
     )
 
@@ -384,10 +434,11 @@ def choose_trial(trials):
 
 
 # ============================================================
-# SELECTION REQUEST VALIDATION
+# SELECTION
 # ============================================================
 
-def validate_selection_request(data):
+def selection_valid(data):
+
     if not isinstance(data, dict):
         return False
 
@@ -398,7 +449,7 @@ def validate_selection_request(data):
 
     if (
         not isinstance(run_id, str)
-        or not run_id
+        or run_id == ""
         or len(run_id) > 128
     ):
         return False
@@ -408,53 +459,55 @@ def validate_selection_request(data):
     if not isinstance(forbidden, list):
         return False
 
-    if not all(isinstance(x, str) for x in forbidden):
+    if not all(
+        isinstance(x, str)
+        for x in forbidden
+    ):
         return False
 
     limit = data.get("numTrialsLimit")
 
-    if not safe_int(limit) or limit <= 0:
+    if not safe_integer(limit) or limit <= 0:
         return False
 
     rows = data.get("rows")
 
-    if not isinstance(rows, list) or not rows:
+    if not isinstance(rows, list) or len(rows) == 0:
         return False
 
     trials = data.get("trials")
 
-    if not isinstance(trials, list):
+    if not valid_selection_rows(rows):
         return False
 
-    if not validate_all_selection_rows(rows):
-        return False
-
-    if not validate_all_trials(trials):
+    if not valid_trials(trials):
         return False
 
     return True
 
 
-# ============================================================
-# BUILD SELECTION RESPONSE
-# ============================================================
-
 def make_selection(data):
 
-    if not validate_selection_request(data):
+    # Invalid selection.
+    if not selection_valid(data):
+
         return {
-            "runId": data.get("runId", "")
-            if isinstance(data, dict)
-            else "",
+            "runId": (
+                data.get("runId", "")
+                if isinstance(data, dict)
+                else ""
+            ),
             "selectedTrialId": None,
             "trainRowIds": [],
             "evalRowIds": [],
             "featureNames": [],
             "datasetDigest": None,
-            "reasonCodes": ["INVALID_INPUT"],
+            "reasonCodes": ["INVALID_INPUT"]
         }
 
+    # Trial limit is a contract failure.
     if len(data["trials"]) > data["numTrialsLimit"]:
+
         return {
             "runId": data["runId"],
             "selectedTrialId": None,
@@ -462,34 +515,50 @@ def make_selection(data):
             "evalRowIds": [],
             "featureNames": [],
             "datasetDigest": None,
-            "reasonCodes": ["TRIAL_LIMIT_EXCEEDED"],
+            "reasonCodes": [
+                "TRIAL_LIMIT_EXCEEDED"
+            ]
         }
 
-    retained = deduplicate_rows(data["rows"])
+    # --------------------------------------------------------
+    # STEP 1: DEDUPLICATE
+    # --------------------------------------------------------
 
-    train_ids = [
+    retained = deduplicate(data["rows"])
+
+    # --------------------------------------------------------
+    # STEP 2: SPLIT RETAINED ROW IDS
+    # --------------------------------------------------------
+
+    train_ids = utf8_sorted([
         row["id"]
         for row in retained
         if row["split"] == "TRAIN"
-    ]
+    ])
 
-    eval_ids = [
+    eval_ids = utf8_sorted([
         row["id"]
         for row in retained
         if row["split"] == "EVAL"
-    ]
+    ])
 
-    train_ids = sorted_utf8(train_ids)
-    eval_ids = sorted_utf8(eval_ids)
+    # --------------------------------------------------------
+    # STEP 3: SHARED POINT-IN-TIME FEATURES
+    # --------------------------------------------------------
 
-    feature_names = find_shared_eligible_features(
+    feature_names = eligible_features(
         retained,
-        data["forbiddenFeatures"],
+        data["forbiddenFeatures"]
     )
 
-    selected = choose_trial(data["trials"])
+    # --------------------------------------------------------
+    # STEP 4: CHOOSE TRIAL
+    # --------------------------------------------------------
+
+    selected = select_trial(data["trials"])
 
     if selected is None:
+
         return {
             "runId": data["runId"],
             "selectedTrialId": None,
@@ -497,16 +566,24 @@ def make_selection(data):
             "evalRowIds": eval_ids,
             "featureNames": feature_names,
             "datasetDigest": None,
-            "reasonCodes": ["NO_SUCCESSFUL_TRIAL"],
+            "reasonCodes": [
+                "NO_SUCCESSFUL_TRIAL"
+            ]
         }
+
+    # --------------------------------------------------------
+    # STEP 5: EXACT DATASET DIGEST OBJECT
+    # --------------------------------------------------------
 
     digest_object = {
         "trainRowIds": train_ids,
         "evalRowIds": eval_ids,
-        "featureNames": feature_names,
+        "featureNames": feature_names
     }
 
-    dataset_digest = sha256_compact_json(digest_object)
+    dataset_digest = sha256_json(
+        digest_object
+    )
 
     return {
         "runId": data["runId"],
@@ -515,15 +592,15 @@ def make_selection(data):
         "evalRowIds": eval_ids,
         "featureNames": feature_names,
         "datasetDigest": dataset_digest,
-        "reasonCodes": [],
+        "reasonCodes": []
     }
 
 
 # ============================================================
-# EVALUATION REQUEST VALIDATION
+# EVALUATION
 # ============================================================
 
-def validate_evaluation_request(data):
+def evaluation_valid(data):
 
     if not isinstance(data, dict):
         return False
@@ -535,19 +612,23 @@ def validate_evaluation_request(data):
 
     if (
         not isinstance(run_id, str)
-        or not run_id
+        or run_id == ""
         or len(run_id) > 128
     ):
         return False
 
-    if not safe_int(data.get("selectedTrialId")):
+    if not safe_integer(
+        data.get("selectedTrialId")
+    ):
         return False
 
-    digest_value = data.get("datasetDigest")
+    dataset_digest = data.get(
+        "datasetDigest"
+    )
 
     if (
-        not isinstance(digest_value, str)
-        or not DIGEST_RE.fullmatch(digest_value)
+        not isinstance(dataset_digest, str)
+        or not DIGEST_RE.fullmatch(dataset_digest)
     ):
         return False
 
@@ -559,14 +640,19 @@ def validate_evaluation_request(data):
     if not 0 <= float(metric_floor) <= 1:
         return False
 
-    required_slices = data.get("requiredSlices")
+    required_slices = data.get(
+        "requiredSlices"
+    )
 
     if not isinstance(required_slices, dict):
         return False
 
     for name, floor in required_slices.items():
 
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str):
+            return False
+
+        if name == "":
             return False
 
         if not finite_number(floor):
@@ -580,58 +666,55 @@ def validate_evaluation_request(data):
     if not isinstance(rows, list):
         return False
 
-    if not safe_int(data.get("bytesProcessed")):
+    if not safe_integer(
+        data.get("bytesProcessed")
+    ):
         return False
 
-    if not safe_int(data.get("maxBytes")):
+    if not safe_integer(
+        data.get("maxBytes")
+    ):
         return False
 
     return True
 
 
-def validate_test_row(row):
+def valid_test_row(row):
+
     if not isinstance(row, dict):
         return False
 
-    if "label" not in row:
+    if row.get("label") not in (0, 1):
         return False
 
-    if "prediction" not in row:
+    if row.get("prediction") not in (0, 1):
         return False
 
-    if "slice" not in row:
+    if not isinstance(row.get("slice"), str):
         return False
 
-    if row["label"] not in (0, 1):
-        return False
-
-    if row["prediction"] not in (0, 1):
-        return False
-
-    if not isinstance(row["slice"], str):
-        return False
-
-    if not row["slice"]:
+    if row["slice"] == "":
         return False
 
     return True
 
 
-# ============================================================
-# EVALUATION
-# ============================================================
-
 def make_evaluation(data):
 
-    if not validate_evaluation_request(data):
+    if not evaluation_valid(data):
+
         return {
-            "runId": data.get("runId", "")
-            if isinstance(data, dict)
-            else "",
+            "runId": (
+                data.get("runId", "")
+                if isinstance(data, dict)
+                else ""
+            ),
             "selectedTrialId": (
                 data.get("selectedTrialId")
                 if isinstance(data, dict)
-                and safe_int(data.get("selectedTrialId"))
+                and safe_integer(
+                    data.get("selectedTrialId")
+                )
                 else None
             ),
             "datasetDigest": (
@@ -645,57 +728,69 @@ def make_evaluation(data):
             "bytesProcessed": (
                 data.get("bytesProcessed")
                 if isinstance(data, dict)
-                and safe_int(data.get("bytesProcessed"))
+                and safe_integer(
+                    data.get("bytesProcessed")
+                )
                 else 0
             ),
-            "reasonCodes": ["INVALID_INPUT"],
+            "reasonCodes": [
+                "INVALID_INPUT"
+            ]
         }
 
     reasons = []
 
     # --------------------------------------------------------
-    # FROZEN LINEAGE
+    # LINEAGE
     # --------------------------------------------------------
 
-    stored = RUNS.get(data["runId"])
+    stored = get_run(data["runId"])
 
     if stored is None:
-        reasons.append("INVALID_LINEAGE")
+
+        reasons.append(
+            "INVALID_LINEAGE"
+        )
 
     else:
+
         saved = stored["response"]
 
         if (
             saved["selectedTrialId"] is None
-            or saved["selectedTrialId"] != data["selectedTrialId"]
-            or saved["datasetDigest"] != data["datasetDigest"]
+            or saved["selectedTrialId"]
+                != data["selectedTrialId"]
+            or saved["datasetDigest"]
+                != data["datasetDigest"]
         ):
-            reasons.append("INVALID_LINEAGE")
+            reasons.append(
+                "INVALID_LINEAGE"
+            )
 
     # --------------------------------------------------------
-    # FINAL TEST ROWS
+    # TEST ROW VALIDATION
     # --------------------------------------------------------
 
     rows = data["rows"]
 
-    invalid_row = False
+    any_invalid = False
 
     for row in rows:
-        if not validate_test_row(row):
-            invalid_row = True
+
+        if not valid_test_row(row):
+            any_invalid = True
             break
 
-    if invalid_row:
-        reasons.append("INVALID_TEST_ROW")
+    if any_invalid:
+        reasons.append(
+            "INVALID_TEST_ROW"
+        )
 
-    # If empty or invalid:
-    #
-    # - testMetric = null
-    # - skip aggregate calculation
-    # - skip slice calculation
-    #
-    # Lineage and byte gates still happen.
-    if not rows or invalid_row:
+    # --------------------------------------------------------
+    # EMPTY / INVALID TEST DATA
+    # --------------------------------------------------------
+
+    if len(rows) == 0 or any_invalid:
 
         test_metric = None
         critical_slice_pass = False
@@ -712,71 +807,80 @@ def make_evaluation(data):
             if row["label"] == row["prediction"]
         )
 
-        test_metric = round(
-            correct / len(rows),
-            12
+        test_metric = round_12(
+            Decimal(correct)
+            / Decimal(len(rows))
         )
 
-        if test_metric < float(data["metricFloor"]):
-            reasons.append("AGGREGATE_FLOOR")
+        if test_metric < float(
+            data["metricFloor"]
+        ):
+            reasons.append(
+                "AGGREGATE_FLOOR"
+            )
 
         # ----------------------------------------------------
-        # REQUIRED SLICES
+        # SLICE ACCURACY
         # ----------------------------------------------------
 
-        groups = {}
+        grouped = {}
 
         for row in rows:
-            groups.setdefault(
+
+            grouped.setdefault(
                 row["slice"],
                 []
             ).append(row)
 
         critical_slice_pass = True
 
-        for slice_name in sorted_utf8(
+        # UTF-8 order isn't needed for calculation,
+        # but deterministic processing is useful.
+        slice_names = utf8_sorted(
             data["requiredSlices"].keys()
-        ):
+        )
+
+        for slice_name in slice_names:
 
             floor = float(
                 data["requiredSlices"][slice_name]
             )
 
-            if slice_name not in groups:
+            if slice_name not in grouped:
+
                 reasons.append(
-                    f"MISSING_SLICE:{slice_name}"
+                    "MISSING_SLICE:"
+                    + slice_name
                 )
+
                 critical_slice_pass = False
                 continue
 
-            group = groups[slice_name]
+            group = grouped[slice_name]
 
             correct_slice = sum(
                 1
                 for row in group
-                if row["label"] == row["prediction"]
+                if row["label"]
+                == row["prediction"]
             )
 
-            slice_accuracy = round(
-                correct_slice / len(group),
-                12
+            slice_accuracy = round_12(
+                Decimal(correct_slice)
+                / Decimal(len(group))
             )
 
             if slice_accuracy < floor:
+
                 reasons.append(
-                    f"SLICE_FLOOR:{slice_name}"
+                    "SLICE_FLOOR:"
+                    + slice_name
                 )
+
                 critical_slice_pass = False
 
     # --------------------------------------------------------
-    # BYTE LIMIT
-    # --------------------------------------------------------
-
-    if data["bytesProcessed"] > data["maxBytes"]:
-        reasons.append("BYTE_LIMIT")
-
-    # --------------------------------------------------------
-    # SLICE PASS FLAG
+    # CRITICAL SLICE FLAG
     # --------------------------------------------------------
 
     if "INVALID_LINEAGE" in reasons:
@@ -785,8 +889,20 @@ def make_evaluation(data):
     if "INVALID_TEST_ROW" in reasons:
         critical_slice_pass = False
 
-    if not rows:
+    if len(rows) == 0:
         critical_slice_pass = False
+
+    # --------------------------------------------------------
+    # BYTE LIMIT
+    # --------------------------------------------------------
+
+    if (
+        data["bytesProcessed"]
+        > data["maxBytes"]
+    ):
+        reasons.append(
+            "BYTE_LIMIT"
+        )
 
     # --------------------------------------------------------
     # DECISION
@@ -794,22 +910,29 @@ def make_evaluation(data):
 
     decision = "admit"
 
-    if reasons:
+    if test_metric is None:
         decision = "reject"
 
-    if test_metric is None:
+    if reasons:
         decision = "reject"
 
     if (
         test_metric is not None
-        and test_metric < float(data["metricFloor"])
+        and test_metric
+            < float(data["metricFloor"])
     ):
         decision = "reject"
 
-    if data["requiredSlices"] and not critical_slice_pass:
+    if (
+        data["requiredSlices"]
+        and not critical_slice_pass
+    ):
         decision = "reject"
 
-    if data["bytesProcessed"] > data["maxBytes"]:
+    if (
+        data["bytesProcessed"]
+        > data["maxBytes"]
+    ):
         decision = "reject"
 
     if stored is None:
@@ -823,18 +946,17 @@ def make_evaluation(data):
         "criticalSlicePass": critical_slice_pass,
         "decision": decision,
         "bytesProcessed": data["bytesProcessed"],
-        "reasonCodes": sorted_codes(reasons),
+        "reasonCodes": sort_codes(reasons)
     }
 
 
 # ============================================================
-# HTTP ENDPOINT
+# ENDPOINT
 # ============================================================
 
 @app.post("/bqml")
 def bqml():
 
-    # Must receive JSON.
     if not request.is_json:
         return jsonify({
             "error": "INVALID_INPUT"
@@ -855,59 +977,67 @@ def bqml():
 
     phase = data.get("phase")
 
-    # Missing/unknown phase has an EXACT response.
+    # Exact required response.
     if phase not in ("select", "evaluate"):
         return jsonify({
             "error": "INVALID_INPUT"
         }), 400
 
-    # --------------------------------------------------------
+    # ========================================================
     # SELECT
-    # --------------------------------------------------------
+    # ========================================================
 
     if phase == "select":
 
         run_id = data.get("runId")
 
-        # For a valid runId, enforce state/replay/conflict.
+        # Valid runId is needed for state/replay.
         if (
             isinstance(run_id, str)
-            and run_id
+            and run_id != ""
             and len(run_id) <= 128
         ):
 
-            fingerprint = sha256_compact_json(data)
+            fingerprint = sha256_json(data)
 
-            if run_id in RUNS:
+            previous = get_run(run_id)
 
-                saved = RUNS[run_id]
+            if previous is not None:
 
-                if saved["fingerprint"] == fingerprint:
+                if (
+                    previous["fingerprint"]
+                    == fingerprint
+                ):
                     return jsonify(
-                        saved["response"]
+                        previous["response"]
                     )
 
                 return jsonify({
-                    "error": "RUN_ID_CONFLICT"
+                    "error":
+                        "RUN_ID_CONFLICT"
                 }), 409
 
             response = make_selection(data)
 
-            # Persist the COMPLETE response.
-            RUNS[run_id] = {
-                "fingerprint": fingerprint,
-                "response": response,
-            }
+            save_run(
+                run_id,
+                fingerprint,
+                response
+            )
 
             return jsonify(response)
 
-        return jsonify(make_selection(data))
+        return jsonify(
+            make_selection(data)
+        )
 
-    # --------------------------------------------------------
+    # ========================================================
     # EVALUATE
-    # --------------------------------------------------------
+    # ========================================================
 
-    return jsonify(make_evaluation(data))
+    return jsonify(
+        make_evaluation(data)
+    )
 
 
 @app.get("/")
@@ -916,7 +1046,12 @@ def root():
 
 
 if __name__ == "__main__":
+
+    port = int(
+        os.environ.get("PORT", "8080")
+    )
+
     app.run(
         host="0.0.0.0",
-        port=8080
+        port=port
     )
